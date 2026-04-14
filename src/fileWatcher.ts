@@ -37,7 +37,10 @@ import {
   PROJECT_SCAN_INTERVAL_MS,
 } from '../server/src/constants.js';
 import { removeAgent } from './agentManager.js';
+import { listPendingCodexLaunches, removePendingCodexLaunch } from './codexLaunchRegistry.js';
+import { processCodexTranscriptLine } from './codexTranscriptParser.js';
 import { TERMINAL_NAME_PREFIX } from './constants.js';
+import { inferProviderFromJsonlPath, pathsOverlap } from './providerUtils.js';
 import { cancelPermissionTimer, cancelWaitingTimer, clearAgentActivity } from './timerManager.js';
 import { processTranscriptLine } from './transcriptParser.js';
 import type { AgentState } from './types.js';
@@ -174,6 +177,7 @@ export function readNewLines(
 ): void {
   const agent = agents.get(agentId);
   if (!agent) return;
+  agent.providerId = agent.providerId ?? inferProviderFromJsonlPath(agent.jsonlFile);
   try {
     const stat = fs.statSync(agent.jsonlFile);
     if (stat.size <= agent.fileOffset) return;
@@ -208,7 +212,11 @@ export function readNewLines(
 
     for (const line of lines) {
       if (!line.trim()) continue;
-      processTranscriptLine(agentId, line, agents, waitingTimers, permissionTimers, webview);
+      if (agent.providerId === 'codex') {
+        processCodexTranscriptLine(agentId, line, agents, waitingTimers, permissionTimers, webview);
+      } else {
+        processTranscriptLine(agentId, line, agents, waitingTimers, permissionTimers, webview);
+      }
     }
   } catch (e) {
     // ENOENT is expected for hook-detected agents where the JSONL file hasn't been created yet
@@ -433,7 +441,7 @@ function scanForNewJsonlFiles(
   }
 }
 
-function adoptTerminalForFile(
+export function adoptTerminalForFile(
   terminal: vscode.Terminal,
   jsonlFile: string,
   projectDir: string,
@@ -447,9 +455,12 @@ function adoptTerminalForFile(
   webview: vscode.Webview | undefined,
   persistAgents: () => void,
   onAgentCreated?: (agent: AgentState) => void,
+  existingAgentId?: number,
+  folderName?: string,
+  existingSessionId?: string,
 ): void {
-  const id = nextAgentIdRef.current++;
-  const sessionId = path.basename(jsonlFile, '.jsonl');
+  const id = existingAgentId ?? nextAgentIdRef.current++;
+  const sessionId = existingSessionId ?? path.basename(jsonlFile, '.jsonl');
   // Skip to end of file -- adopted terminals show live activity only, not replay history
   let fileOffset = 0;
   try {
@@ -479,6 +490,8 @@ function adoptTerminalForFile(
     lastDataAt: 0,
     linesProcessed: 0,
     seenUnknownRecordTypes: new Set(),
+    folderName,
+    providerId: inferProviderFromJsonlPath(jsonlFile),
     hookDelivered: false,
   };
 
@@ -490,7 +503,7 @@ function adoptTerminalForFile(
   console.log(
     `[Pixel Agents] Watcher: Agent ${id} - adopted terminal "${terminal.name}" for ${path.basename(jsonlFile)}`,
   );
-  webview?.postMessage({ type: 'agentCreated', id });
+  webview?.postMessage({ type: 'agentCreated', id, folderName });
 
   startFileWatching(
     id,
@@ -564,6 +577,7 @@ export function adoptExternalSessionFromHook(
     }
     if (adoptedAgent) {
       adoptedAgent.sessionId = sessionId;
+      adoptedAgent.providerId = inferProviderFromJsonlPath(transcriptPath);
       adoptedAgent.hookDelivered = true;
       onAgentCreated?.(adoptedAgent);
     }
@@ -595,6 +609,7 @@ export function adoptExternalSessionFromHook(
       linesProcessed: 0,
       seenUnknownRecordTypes: new Set(),
       folderName,
+      providerId: 'claude',
     };
     agents.set(id, agent);
     persistAgents();
@@ -653,6 +668,7 @@ function adoptExternalSession(
     linesProcessed: 0,
     seenUnknownRecordTypes: new Set(),
     folderName,
+    providerId: inferProviderFromJsonlPath(jsonlFile),
   };
 
   agents.set(id, agent);
@@ -673,6 +689,175 @@ function adoptExternalSession(
     webview,
   );
   readNewLines(id, agents, waitingTimers, permissionTimers, webview);
+}
+
+interface CodexSessionMeta {
+  cwd: string;
+  sessionId: string;
+}
+
+function getWorkspaceRoots(): string[] {
+  const roots = (vscode.workspace.workspaceFolders ?? []).map((folder) => folder.uri.fsPath);
+  return roots.length > 0 ? roots : [os.homedir()];
+}
+
+function readCodexSessionMeta(jsonlFile: string): CodexSessionMeta | null {
+  try {
+    const fd = fs.openSync(jsonlFile, 'r');
+    const buf = Buffer.alloc(16_384);
+    const bytesRead = fs.readSync(fd, buf, 0, buf.length, 0);
+    fs.closeSync(fd);
+    const snippet = buf.toString('utf-8', 0, bytesRead);
+    if (!snippet.includes('"type":"session_meta"')) return null;
+
+    const cwdMatch = snippet.match(/"cwd":"((?:\\.|[^"])*)"/);
+    const sessionIdMatch = snippet.match(/"id":"((?:\\.|[^"])*)"/);
+    if (!cwdMatch) return null;
+
+    const cwd = JSON.parse(`"${cwdMatch[1]}"`) as string;
+    const sessionId = sessionIdMatch
+      ? (JSON.parse(`"${sessionIdMatch[1]}"`) as string)
+      : path.basename(jsonlFile, '.jsonl');
+    return { cwd, sessionId };
+  } catch {
+    return null;
+  }
+}
+
+function collectCodexSessionFiles(dir: string, files: string[] = []): string[] {
+  let entries: fs.Dirent[];
+  try {
+    entries = fs.readdirSync(dir, { withFileTypes: true });
+  } catch {
+    return files;
+  }
+
+  for (const entry of entries) {
+    const fullPath = path.join(dir, entry.name);
+    if (entry.isDirectory()) {
+      collectCodexSessionFiles(fullPath, files);
+      continue;
+    }
+    if (entry.isFile() && entry.name.endsWith('.jsonl')) {
+      files.push(fullPath);
+    }
+  }
+  return files;
+}
+
+function scanCodexSessions(
+  knownJsonlFiles: Set<string>,
+  nextAgentIdRef: { current: number },
+  agents: Map<number, AgentState>,
+  fileWatchers: Map<number, fs.FSWatcher>,
+  pollingTimers: Map<number, ReturnType<typeof setInterval>>,
+  waitingTimers: Map<number, ReturnType<typeof setTimeout>>,
+  permissionTimers: Map<number, ReturnType<typeof setTimeout>>,
+  jsonlPollTimers: Map<number, ReturnType<typeof setInterval>>,
+  webview: vscode.Webview | undefined,
+  persistAgents: () => void,
+  watchAllSessions: boolean,
+): void {
+  const sessionsRoot = path.join(os.homedir(), '.codex', 'sessions');
+  const workspaceRoots = getWorkspaceRoots();
+  const now = Date.now();
+  const files = collectCodexSessionFiles(sessionsRoot);
+
+  for (const file of files) {
+    if (knownJsonlFiles.has(file)) continue;
+    if (clearDismissedFiles.has(file)) continue;
+
+    const dismissedAt = dismissedJsonlFiles.get(file);
+    if (dismissedAt && now - dismissedAt < DISMISSED_COOLDOWN_MS) continue;
+    if (dismissedAt) dismissedJsonlFiles.delete(file);
+
+    let tracked = false;
+    for (const agent of agents.values()) {
+      if (path.resolve(agent.jsonlFile) === path.resolve(file)) {
+        tracked = true;
+        break;
+      }
+    }
+    if (tracked) continue;
+
+    try {
+      const stat = fs.statSync(file);
+      if (now - stat.mtimeMs > EXTERNAL_ACTIVE_THRESHOLD_MS) continue;
+    } catch {
+      continue;
+    }
+
+    const meta = readCodexSessionMeta(file);
+    if (!meta?.cwd) continue;
+    if (!watchAllSessions && !workspaceRoots.some((root) => pathsOverlap(root, meta.cwd))) {
+      continue;
+    }
+
+    const pendingLaunch = listPendingCodexLaunches()
+      .filter(
+        (launch) =>
+          launch.terminal.exitStatus === undefined &&
+          pathsOverlap(launch.cwd, meta.cwd) &&
+          now - launch.launchedAt <= 60_000,
+      )
+      .sort((left, right) => right.launchedAt - left.launchedAt)[0];
+
+    knownJsonlFiles.add(file);
+    if (pendingLaunch) {
+      const launchPollTimer = jsonlPollTimers.get(pendingLaunch.agentId);
+      if (launchPollTimer) {
+        clearInterval(launchPollTimer);
+        jsonlPollTimers.delete(pendingLaunch.agentId);
+      }
+      removePendingCodexLaunch(pendingLaunch.agentId);
+      console.log(
+        `[Pixel Agents] Watcher: matched Codex launch ${path.basename(file)} to terminal "${pendingLaunch.terminal.name}"`,
+      );
+      adoptTerminalForFile(
+        pendingLaunch.terminal,
+        file,
+        meta.cwd,
+        nextAgentIdRef,
+        agents,
+        { current: pendingLaunch.agentId },
+        fileWatchers,
+        pollingTimers,
+        waitingTimers,
+        permissionTimers,
+        webview,
+        persistAgents,
+        undefined,
+        pendingLaunch.agentId,
+        pendingLaunch.folderName,
+        meta.sessionId,
+      );
+      continue;
+    }
+
+    console.log(
+      `[Pixel Agents] Watcher: detected Codex session ${path.basename(file)} (${path.basename(meta.cwd)})`,
+    );
+    adoptExternalSession(
+      file,
+      meta.cwd,
+      nextAgentIdRef,
+      agents,
+      fileWatchers,
+      pollingTimers,
+      waitingTimers,
+      permissionTimers,
+      webview,
+      persistAgents,
+      path.basename(meta.cwd),
+    );
+
+    const adoptedAgent = [...agents.values()].find((agent) => agent.jsonlFile === file);
+    if (adoptedAgent) {
+      adoptedAgent.sessionId = meta.sessionId;
+      adoptedAgent.providerId = 'codex';
+      persistAgents();
+    }
+  }
 }
 
 /**
@@ -715,6 +900,19 @@ export function startExternalSessionScanning(
         );
       }
     }
+    scanCodexSessions(
+      knownJsonlFiles,
+      nextAgentIdRef,
+      agents,
+      fileWatchers,
+      pollingTimers,
+      waitingTimers,
+      permissionTimers,
+      _jsonlPollTimers,
+      webview,
+      persistAgents,
+      !!watchAllSessionsRef?.current,
+    );
     // If "Watch All Sessions" is ON, also scan all global project dirs
     if (watchAllSessionsRef?.current) {
       scanGlobalProjectDirs(
@@ -972,14 +1170,15 @@ export function startStaleExternalAgentCheck(
     for (const [id, agent] of agents) {
       if (!agent.isExternal) continue;
 
-      // Only despawn if the JSONL file has been deleted from disk.
-      // Inactive external agents stay alive so they can resume when
-      // the session continues (e.g., claude --resume).
       try {
-        fs.statSync(agent.jsonlFile);
-        // File still exists — keep the agent alive regardless of mtime
+        const stat = fs.statSync(agent.jsonlFile);
+        if (agent.providerId === 'codex') {
+          const lastSeenAt = Math.max(agent.lastDataAt, stat.mtimeMs);
+          if (Date.now() - lastSeenAt > GLOBAL_SCAN_ACTIVE_MAX_AGE_MS) {
+            toRemove.push(id);
+          }
+        }
       } catch {
-        // File deleted — remove agent
         toRemove.push(id);
       }
     }

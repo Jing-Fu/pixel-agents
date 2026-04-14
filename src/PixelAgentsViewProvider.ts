@@ -626,9 +626,15 @@ export class PixelAgentsViewProvider implements vscode.WebviewViewProvider {
         }
         this.webview?.postMessage({ type: 'agentDiagnostics', agents: diagnostics });
       } else if (message.type === 'openSessionsFolder') {
+        const codexSessionsDir = path.join(os.homedir(), '.codex', 'sessions');
         const projectDir = getProjectDirPath();
-        if (projectDir && fs.existsSync(projectDir)) {
-          vscode.env.openExternal(vscode.Uri.file(projectDir));
+        const targetDir = fs.existsSync(codexSessionsDir)
+          ? codexSessionsDir
+          : fs.existsSync(projectDir)
+            ? projectDir
+            : null;
+        if (targetDir) {
+          vscode.env.openExternal(vscode.Uri.file(targetDir));
         }
       } else if (message.type === 'exportLayout') {
         const layout = readLayoutFromFile();
