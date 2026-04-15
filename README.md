@@ -102,6 +102,12 @@ To use furniture from an external directory, open Settings → **Add Asset Direc
 
 Characters are based on the amazing work of [JIK-A-4, Metro City](https://jik-a-4.itch.io/metrocity-free-topdown-character-pack).
 
+Additional character attribution:
+
+- `char_6` (Pikachu) is adapted from [PMD Sprite Repository](https://sprites.pmdcollab.org/#/0025?form=0) / [SpriteCollab](https://github.com/PMDCollab/SpriteCollab).
+- Primary credit for this sprite set is `CHUNSOFT` (per SpriteCollab metadata for `0025` form `0`).
+- SpriteCollab submission/use policy: [SpriteCollab README](https://github.com/PMDCollab/SpriteCollab/blob/master/README.md).
+
 ## How It Works
 
 Pixel Agents watches supported agent transcripts to track what each agent is doing. When an agent uses a tool (like writing a file or running a command), the extension detects it and updates the character's animation accordingly. No modifications to the agent runtime are needed — it's purely observational.
