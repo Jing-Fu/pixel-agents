@@ -166,6 +166,24 @@ describe('HookEventHandler', () => {
     expect(waitMsg).toBeTruthy();
   });
 
+  it('UserPromptSubmit marks agent active and clears waiting state', () => {
+    const agent = createTestAgent({ id: 1, isWaiting: true, permissionSent: true });
+    agents.set(1, agent);
+    handler.registerAgent('sess-1', 1);
+
+    handler.handleEvent('copilot', {
+      hook_event_name: 'UserPromptSubmit',
+      session_id: 'sess-1',
+    });
+
+    expect(agent.isWaiting).toBe(false);
+    expect(agent.permissionSent).toBe(false);
+    const activeMsg = mockWebview.messages.find(
+      (m) => m.type === 'agentStatus' && m.status === 'active',
+    );
+    expect(activeMsg).toBeTruthy();
+  });
+
   it('Stop clears foreground tools but preserves background agents', () => {
     const agent = createTestAgent({ id: 1 });
     agent.activeToolIds.add('fg-tool');
@@ -544,7 +562,7 @@ describe('HookEventHandler', () => {
     expect(onExternalSessionDetected).not.toHaveBeenCalled();
 
     // Simulate the provider creating the agent (callback side effect)
-    onExternalSessionDetected.mockImplementation((sessionId: string) => {
+    onExternalSessionDetected.mockImplementation((_providerId: string, sessionId: string) => {
       const agent = createTestAgent({
         id: 2,
         sessionId,
@@ -561,6 +579,7 @@ describe('HookEventHandler', () => {
     });
 
     expect(onExternalSessionDetected).toHaveBeenCalledWith(
+      'claude',
       'ext-sess',
       '/projects/test/ext-sess.jsonl',
       '/projects/test',
@@ -689,7 +708,7 @@ describe('HookEventHandler', () => {
     expect(onExternalSessionDetected).not.toHaveBeenCalled();
 
     // Simulate agent creation on confirmation
-    onExternalSessionDetected.mockImplementation((sessionId: string) => {
+    onExternalSessionDetected.mockImplementation((_providerId: string, sessionId: string) => {
       const agent = createTestAgent({
         id: 2,
         sessionId,
@@ -706,7 +725,42 @@ describe('HookEventHandler', () => {
     });
 
     expect(onExternalSessionDetected).toHaveBeenCalledWith(
+      'claude',
       'no-transcript-sess',
+      undefined,
+      '/projects/test',
+    );
+  });
+
+  it('pending external Copilot session preserves provider id', () => {
+    const onExternalSessionDetected = vi.fn();
+    handler.setLifecycleCallbacks({ onExternalSessionDetected });
+
+    handler.handleEvent('copilot', {
+      hook_event_name: 'SessionStart',
+      session_id: 'copilot-sess',
+      source: 'startup',
+      cwd: '/projects/test',
+    });
+
+    onExternalSessionDetected.mockImplementation((_providerId: string, sessionId: string) => {
+      const agent = createTestAgent({
+        id: 2,
+        sessionId,
+        projectDir: '/projects/test',
+      } as Partial<AgentState>);
+      agents.set(2, agent);
+      handler.registerAgent(sessionId, 2);
+    });
+
+    handler.handleEvent('copilot', {
+      hook_event_name: 'UserPromptSubmit',
+      session_id: 'copilot-sess',
+    });
+
+    expect(onExternalSessionDetected).toHaveBeenCalledWith(
+      'copilot',
+      'copilot-sess',
       undefined,
       '/projects/test',
     );

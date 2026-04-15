@@ -1,6 +1,6 @@
 import * as path from 'path';
 
-export type ProviderId = 'claude' | 'codex';
+export type ProviderId = 'claude' | 'codex' | 'copilot';
 
 function normalizeFsPath(value: string): string {
   return path.resolve(value).toLowerCase();
@@ -8,6 +8,9 @@ function normalizeFsPath(value: string): string {
 
 export function inferProviderFromJsonlPath(filePath: string): ProviderId {
   const normalized = normalizeFsPath(filePath);
+  if (normalized.includes(`${path.sep}.copilot${path.sep}session-state${path.sep}`)) {
+    return 'copilot';
+  }
   if (normalized.includes(`${path.sep}.codex${path.sep}`)) {
     return 'codex';
   }

@@ -10,6 +10,11 @@ import {
   installHooks,
   uninstallHooks,
 } from '../server/src/providers/file/claudeHookInstaller.js';
+import {
+  copyCopilotHookScript,
+  installCopilotHooks,
+  uninstallCopilotHooks,
+} from '../server/src/providers/file/copilotHookInstaller.js';
 import { PixelAgentsServer } from '../server/src/server.js';
 import {
   getProjectDirPath,
@@ -36,6 +41,7 @@ import {
   sendFloorTilesToWebview,
   sendWallTilesToWebview,
 } from './assetLoader.js';
+import { listPendingTerminalLaunches, removePendingTerminalLaunch } from './codexLaunchRegistry.js';
 import { readConfig, writeConfig } from './configPersistence.js';
 import {
   GLOBAL_KEY_ALWAYS_SHOW_LABELS,
@@ -49,8 +55,10 @@ import {
 } from './constants.js';
 import {
   adoptExternalSessionFromHook,
+  adoptTerminalForFile,
   dismissedJsonlFiles,
   ensureProjectScan,
+  getCopilotSessionFile,
   isTrackedProjectDir,
   reassignAgentToFile,
   seededMtimes,
@@ -119,6 +127,27 @@ export class PixelAgentsViewProvider implements vscode.WebviewViewProvider {
     persistAgents(this.agents, this.context);
   };
 
+  private getWorkspaceFolders(): readonly vscode.WorkspaceFolder[] {
+    return vscode.workspace.workspaceFolders ?? [];
+  }
+
+  private syncWorkspaceHooks(enabled: boolean): void {
+    if (enabled) {
+      installHooks();
+      copyHookScript(this.context.extensionPath);
+      copyCopilotHookScript(this.context.extensionPath);
+      for (const folder of this.getWorkspaceFolders()) {
+        installCopilotHooks(folder.uri.fsPath);
+      }
+      return;
+    }
+
+    uninstallHooks();
+    for (const folder of this.getWorkspaceFolders()) {
+      uninstallCopilotHooks(folder.uri.fsPath);
+    }
+  }
+
   private initHooks(): void {
     this.hookEventHandler = new HookEventHandler(
       this.agents,
@@ -129,15 +158,59 @@ export class PixelAgentsViewProvider implements vscode.WebviewViewProvider {
     );
 
     this.hookEventHandler.setLifecycleCallbacks({
-      onExternalSessionDetected: (sessionId, transcriptPath, cwd) => {
+      onExternalSessionDetected: (providerId, sessionId, transcriptPath, cwd) => {
+        const pendingLaunch = listPendingTerminalLaunches()
+          .filter(
+            (launch) =>
+              launch.providerId === providerId &&
+              launch.terminal.exitStatus === undefined &&
+              path.resolve(launch.cwd).toLowerCase() === path.resolve(cwd).toLowerCase() &&
+              Date.now() - launch.launchedAt <= 60_000,
+          )
+          .sort((left, right) => right.launchedAt - left.launchedAt)[0];
+
+        const resolvedTranscriptPath =
+          transcriptPath ||
+          (providerId === 'copilot' ? getCopilotSessionFile(sessionId) : undefined);
+
+        if (pendingLaunch && resolvedTranscriptPath) {
+          const launchPollTimer = this.jsonlPollTimers.get(pendingLaunch.agentId);
+          if (launchPollTimer) {
+            clearInterval(launchPollTimer);
+            this.jsonlPollTimers.delete(pendingLaunch.agentId);
+          }
+          removePendingTerminalLaunch(pendingLaunch.agentId);
+          this.knownJsonlFiles.add(resolvedTranscriptPath);
+          adoptTerminalForFile(
+            pendingLaunch.terminal,
+            resolvedTranscriptPath,
+            cwd,
+            this.nextAgentId,
+            this.agents,
+            this.activeAgentId,
+            this.fileWatchers,
+            this.pollingTimers,
+            this.waitingTimers,
+            this.permissionTimers,
+            this.webview,
+            this.persistAgents,
+            (agent) => this.registerAgentHook(agent),
+            pendingLaunch.agentId,
+            pendingLaunch.folderName,
+            sessionId,
+          );
+          return;
+        }
+
         // Workspace filtering: only adopt if in a tracked project dir or Watch All Sessions is ON
-        const projectDir = transcriptPath ? path.dirname(transcriptPath) : cwd;
+        const projectDir = resolvedTranscriptPath ? path.dirname(resolvedTranscriptPath) : cwd;
         if (!isTrackedProjectDir(projectDir) && !this.watchAllSessions.current) {
           return; // Not our workspace and Watch All is OFF, ignore
         }
         adoptExternalSessionFromHook(
+          providerId,
           sessionId,
-          transcriptPath,
+          resolvedTranscriptPath,
           cwd,
           this.knownJsonlFiles,
           this.nextAgentId,
@@ -184,8 +257,10 @@ export class PixelAgentsViewProvider implements vscode.WebviewViewProvider {
         const agent = this.agents.get(agentId);
         if (!agent) return;
         // Dismiss the file so heuristic scanners don't re-adopt it
-        seededMtimes.delete(agent.jsonlFile);
-        dismissedJsonlFiles.set(agent.jsonlFile, Date.now());
+        if (agent.jsonlFile) {
+          seededMtimes.delete(agent.jsonlFile);
+          dismissedJsonlFiles.set(agent.jsonlFile, Date.now());
+        }
         // External agents: remove immediately (no terminal to keep alive)
         if (agent.isExternal) {
           this.unregisterAgentHook(agent);
@@ -218,8 +293,7 @@ export class PixelAgentsViewProvider implements vscode.WebviewViewProvider {
         const hooksEnabled = this.context.globalState.get<boolean>(GLOBAL_KEY_HOOKS_ENABLED, true);
         this.hooksEnabled.current = hooksEnabled;
         if (hooksEnabled) {
-          installHooks();
-          copyHookScript(this.context.extensionPath);
+          this.syncWorkspaceHooks(true);
         }
         console.log(`[Pixel Agents] Server: ready on port ${config.port}`);
       })
@@ -248,8 +322,10 @@ export class PixelAgentsViewProvider implements vscode.WebviewViewProvider {
 
     webviewView.webview.onDidReceiveMessage(async (message) => {
       if (message.type === 'openClaude') {
+        const providerId = 'codex';
         const prevAgentIds = new Set(this.agents.keys());
         await launchNewTerminal(
+          providerId,
           this.nextAgentId,
           this.nextTerminalIndex,
           this.agents,
@@ -272,6 +348,32 @@ export class PixelAgentsViewProvider implements vscode.WebviewViewProvider {
             this.registerAgentHook(agent);
           }
         }
+      } else if (message.type === 'openAgent') {
+        const providerId = (message.provider as 'codex' | 'copilot' | undefined) ?? 'codex';
+        const prevAgentIds = new Set(this.agents.keys());
+        await launchNewTerminal(
+          providerId,
+          this.nextAgentId,
+          this.nextTerminalIndex,
+          this.agents,
+          this.activeAgentId,
+          this.knownJsonlFiles,
+          this.fileWatchers,
+          this.pollingTimers,
+          this.waitingTimers,
+          this.permissionTimers,
+          this.jsonlPollTimers,
+          this.projectScanTimer,
+          this.webview,
+          this.persistAgents,
+          message.folderPath as string | undefined,
+          message.bypassPermissions as boolean | undefined,
+        );
+        for (const [id, agent] of this.agents) {
+          if (!prevAgentIds.has(id)) {
+            this.registerAgentHook(agent);
+          }
+        }
       } else if (message.type === 'focusAgent') {
         const agent = this.agents.get(message.id);
         if (agent) {
@@ -288,7 +390,9 @@ export class PixelAgentsViewProvider implements vscode.WebviewViewProvider {
           } else {
             // External agent — remove from tracking and dismiss the file
             // so the external scanner doesn't re-adopt it
-            dismissedJsonlFiles.set(agent.jsonlFile, Date.now());
+            if (agent.jsonlFile) {
+              dismissedJsonlFiles.set(agent.jsonlFile, Date.now());
+            }
             removeAgent(
               message.id,
               this.agents,
@@ -319,14 +423,8 @@ export class PixelAgentsViewProvider implements vscode.WebviewViewProvider {
         const enabled = message.enabled as boolean;
         this.context.globalState.update(GLOBAL_KEY_HOOKS_ENABLED, enabled);
         this.hooksEnabled.current = enabled;
-        if (enabled) {
-          installHooks();
-          copyHookScript(this.context.extensionPath);
-          console.log('[Pixel Agents] Hooks enabled by user');
-        } else {
-          uninstallHooks();
-          console.log('[Pixel Agents] Hooks disabled by user');
-        }
+        this.syncWorkspaceHooks(enabled);
+        console.log(`[Pixel Agents] Hooks ${enabled ? 'enabled' : 'disabled'} by user`);
       } else if (message.type === 'setHooksInfoShown') {
         this.context.globalState.update(GLOBAL_KEY_HOOKS_INFO_SHOWN, true);
       } else if (message.type === 'setWatchAllSessions') {
@@ -467,6 +565,7 @@ export class PixelAgentsViewProvider implements vscode.WebviewViewProvider {
             this.knownJsonlFiles,
             this.nextAgentId,
             this.agents,
+            this.activeAgentId,
             this.fileWatchers,
             this.pollingTimers,
             this.waitingTimers,
@@ -627,12 +726,15 @@ export class PixelAgentsViewProvider implements vscode.WebviewViewProvider {
         this.webview?.postMessage({ type: 'agentDiagnostics', agents: diagnostics });
       } else if (message.type === 'openSessionsFolder') {
         const codexSessionsDir = path.join(os.homedir(), '.codex', 'sessions');
+        const copilotSessionsDir = path.join(os.homedir(), '.copilot', 'session-state');
         const projectDir = getProjectDirPath();
         const targetDir = fs.existsSync(codexSessionsDir)
           ? codexSessionsDir
-          : fs.existsSync(projectDir)
-            ? projectDir
-            : null;
+          : fs.existsSync(copilotSessionsDir)
+            ? copilotSessionsDir
+            : fs.existsSync(projectDir)
+              ? projectDir
+              : null;
         if (targetDir) {
           vscode.env.openExternal(vscode.Uri.file(targetDir));
         }

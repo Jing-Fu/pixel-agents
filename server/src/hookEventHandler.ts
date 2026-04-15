@@ -3,7 +3,12 @@
 import * as path from 'path';
 import type * as vscode from 'vscode';
 
-import { cancelPermissionTimer, cancelWaitingTimer } from '../../src/timerManager.js';
+import type { ProviderId } from '../../src/providerUtils.js';
+import {
+  cancelPermissionTimer,
+  cancelWaitingTimer,
+  clearAgentActivity,
+} from '../../src/timerManager.js';
 import { formatToolStatus } from '../../src/transcriptParser.js';
 import type { AgentState } from '../../src/types.js';
 import { HOOK_EVENT_BUFFER_MS, SESSION_END_GRACE_MS } from './constants.js';
@@ -22,7 +27,7 @@ export interface HookEvent {
 
 /** An event waiting to be dispatched once its agent registers. */
 interface BufferedEvent {
-  providerId: string;
+  providerId: ProviderId;
   event: HookEvent;
   timestamp: number;
 }
@@ -42,6 +47,7 @@ interface SessionLifecycleCallbacks {
   /** Called when an external session is detected (unknown session_id in SessionStart).
    *  transcriptPath is undefined for providers without transcripts (OpenCode, Copilot). */
   onExternalSessionDetected?: (
+    providerId: ProviderId,
     sessionId: string,
     transcriptPath: string | undefined,
     cwd: string,
@@ -60,6 +66,7 @@ interface SessionLifecycleCallbacks {
 
 /** Pending external session info (waiting for confirmation event before creating agent). */
 interface PendingExternalSession {
+  providerId: ProviderId;
   sessionId: string;
   /** Transcript file path. Undefined for providers without transcripts (OpenCode, Copilot). */
   transcriptPath: string | undefined;
@@ -115,7 +122,8 @@ export class HookEventHandler {
    * @param providerId - Provider that sent the event ('claude', 'codex', etc.)
    * @param event - The hook event payload from the CLI tool
    */
-  handleEvent(_providerId: string, event: HookEvent): void {
+  handleEvent(providerIdRaw: string, event: HookEvent): void {
+    const providerId = (providerIdRaw === 'copilot' ? 'copilot' : providerIdRaw) as ProviderId;
     const eventName = event.hook_event_name;
 
     // --- SessionStart: handle /clear for known agents, ignore unknown sessions ---
@@ -202,6 +210,7 @@ export class HookEventHandler {
             `[Pixel Agents] Hook: SessionStart(source=${source}) -> pending external session ${sid}..., awaiting confirmation`,
           );
         this.pendingExternalSessions.set(event.session_id, {
+          providerId,
           sessionId: event.session_id,
           transcriptPath: transcriptPath2,
           cwd: cwd ?? '',
@@ -235,12 +244,13 @@ export class HookEventHandler {
           `[Pixel Agents] Hook: ${eventName} confirmed external session ${event.session_id.slice(0, 8)}..., creating agent`,
         );
       this.lifecycleCallbacks.onExternalSessionDetected?.(
+        pending.providerId,
         pending.sessionId,
         pending.transcriptPath,
         pending.cwd,
       );
       // Re-process this event now that the agent exists
-      this.handleEvent(_providerId, event);
+      this.handleEvent(providerId, event);
       return;
     }
 
@@ -270,7 +280,7 @@ export class HookEventHandler {
           console.log(
             `[Pixel Agents] Hook: ${eventName} - unknown session ${event.session_id.slice(0, 8)}..., buffering`,
           );
-        this.bufferEvent(_providerId, event);
+        this.bufferEvent(providerId, event);
       }
       return;
     }
@@ -304,6 +314,8 @@ export class HookEventHandler {
       this.handleNotification(event, agent, agentId, webview);
     } else if (eventName === 'Stop') {
       this.handleStop(agent, agentId, webview);
+    } else if (eventName === 'UserPromptSubmit') {
+      this.handleUserPromptSubmit(agent, agentId, webview);
     }
   }
 
@@ -569,6 +581,23 @@ export class HookEventHandler {
     this.markAgentWaiting(agent, agentId, webview);
   }
 
+  /** Handle a new user prompt: clear stale tool state and immediately mark active. */
+  private handleUserPromptSubmit(
+    agent: AgentState,
+    agentId: number,
+    webview: vscode.Webview | undefined,
+  ): void {
+    cancelWaitingTimer(agentId, this.waitingTimers);
+    clearAgentActivity(agent, agentId, this.permissionTimers, webview);
+    agent.isWaiting = false;
+    agent.permissionSent = false;
+    webview?.postMessage({
+      type: 'agentStatus',
+      id: agentId,
+      status: 'active',
+    });
+  }
+
   /**
    * Transition agent to waiting state. Clears foreground tools (preserves background
    * agents), cancels timers, and notifies the webview. Same logic as the turn_duration
@@ -629,7 +658,7 @@ export class HookEventHandler {
   }
 
   /** Buffer an event for later delivery when the agent registers. */
-  private bufferEvent(providerId: string, event: HookEvent): void {
+  private bufferEvent(providerId: ProviderId, event: HookEvent): void {
     this.bufferedEvents.push({ providerId, event, timestamp: Date.now() });
     if (!this.bufferTimer) {
       this.bufferTimer = setInterval(() => {

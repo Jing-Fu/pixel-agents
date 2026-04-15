@@ -4,7 +4,10 @@ import * as path from 'path';
 import * as vscode from 'vscode';
 
 import { JSONL_POLL_INTERVAL_MS } from '../server/src/constants.js';
-import { registerPendingCodexLaunch, removePendingCodexLaunch } from './codexLaunchRegistry.js';
+import {
+  registerPendingTerminalLaunch,
+  removePendingTerminalLaunch,
+} from './codexLaunchRegistry.js';
 import {
   TERMINAL_NAME_PREFIX,
   WORKSPACE_KEY_AGENT_SEATS,
@@ -12,9 +15,20 @@ import {
 } from './constants.js';
 import { ensureProjectScan, startFileWatching } from './fileWatcher.js';
 import { migrateAndLoadLayout } from './layoutPersistence.js';
-import { inferProviderFromJsonlPath } from './providerUtils.js';
+import { inferProviderFromJsonlPath, type ProviderId } from './providerUtils.js';
 import { cancelPermissionTimer, cancelWaitingTimer } from './timerManager.js';
 import type { AgentState, PersistedAgent } from './types.js';
+
+function terminalNamePrefix(providerId: ProviderId): string {
+  return providerId === 'copilot' ? 'Copilot' : TERMINAL_NAME_PREFIX;
+}
+
+function launchCommand(providerId: ProviderId, bypassPermissions?: boolean): string {
+  if (providerId === 'copilot') {
+    return 'copilot';
+  }
+  return bypassPermissions ? 'codex --dangerously-bypass-approvals-and-sandbox' : 'codex';
+}
 
 export function getProjectDirPath(cwd?: string): string {
   // Fall back to home directory when no workspace folder is open.
@@ -58,6 +72,7 @@ export function getProjectDirPath(cwd?: string): string {
 }
 
 export async function launchNewTerminal(
+  providerId: ProviderId,
   nextAgentIdRef: { current: number },
   nextTerminalIndexRef: { current: number },
   agents: Map<number, AgentState>,
@@ -79,7 +94,7 @@ export async function launchNewTerminal(
   const isMultiRoot = !!(folders && folders.length > 1);
   const idx = nextTerminalIndexRef.current++;
   const terminal = vscode.window.createTerminal({
-    name: `${TERMINAL_NAME_PREFIX} #${idx}`,
+    name: `${terminalNamePrefix(providerId)} #${idx}`,
     cwd,
   });
   terminal.show();
@@ -87,40 +102,40 @@ export async function launchNewTerminal(
   const id = nextAgentIdRef.current++;
   const folderName = isMultiRoot && cwd ? path.basename(cwd) : undefined;
   const launchedAt = Date.now();
-  registerPendingCodexLaunch({
+  registerPendingTerminalLaunch({
     agentId: id,
+    providerId,
     terminal,
     cwd,
     folderName,
     launchedAt,
   });
 
-  const codexCmd = bypassPermissions ? 'codex --dangerously-bypass-approvals-and-sandbox' : 'codex';
-  terminal.sendText(codexCmd);
+  terminal.sendText(launchCommand(providerId, bypassPermissions));
 
-  console.log(`[Pixel Agents] Terminal: Agent ${id} - launched Codex in ${cwd}`);
+  console.log(`[Pixel Agents] Terminal: Agent ${id} - launched ${providerId} in ${cwd}`);
 
   const pollTimer = setInterval(() => {
     if (agents.has(id)) {
       clearInterval(pollTimer);
       jsonlPollTimers.delete(id);
-      removePendingCodexLaunch(id);
+      removePendingTerminalLaunch(id);
       return;
     }
 
     if (terminal.exitStatus !== undefined) {
       clearInterval(pollTimer);
       jsonlPollTimers.delete(id);
-      removePendingCodexLaunch(id);
+      removePendingTerminalLaunch(id);
       return;
     }
 
     if (Date.now() - launchedAt > 60_000) {
       clearInterval(pollTimer);
       jsonlPollTimers.delete(id);
-      removePendingCodexLaunch(id);
+      removePendingTerminalLaunch(id);
       console.warn(
-        `[Pixel Agents] Terminal: Agent ${id} - timed out waiting for Codex session detection`,
+        `[Pixel Agents] Terminal: Agent ${id} - timed out waiting for ${providerId} session detection`,
       );
     }
   }, JSONL_POLL_INTERVAL_MS);
@@ -225,7 +240,7 @@ export function restoreAgents(
       try {
         if (!fs.existsSync(p.jsonlFile)) continue;
         if (
-          (p.providerId ?? inferProviderFromJsonlPath(p.jsonlFile)) === 'codex' &&
+          ['codex', 'copilot'].includes(p.providerId ?? inferProviderFromJsonlPath(p.jsonlFile)) &&
           Date.now() - fs.statSync(p.jsonlFile).mtimeMs > 600_000
         ) {
           continue;

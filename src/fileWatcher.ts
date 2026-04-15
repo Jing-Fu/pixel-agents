@@ -37,9 +37,10 @@ import {
   PROJECT_SCAN_INTERVAL_MS,
 } from '../server/src/constants.js';
 import { removeAgent } from './agentManager.js';
-import { listPendingCodexLaunches, removePendingCodexLaunch } from './codexLaunchRegistry.js';
+import { listPendingTerminalLaunches, removePendingTerminalLaunch } from './codexLaunchRegistry.js';
 import { processCodexTranscriptLine } from './codexTranscriptParser.js';
 import { TERMINAL_NAME_PREFIX } from './constants.js';
+import type { ProviderId } from './providerUtils.js';
 import { inferProviderFromJsonlPath, pathsOverlap } from './providerUtils.js';
 import { cancelPermissionTimer, cancelWaitingTimer, clearAgentActivity } from './timerManager.js';
 import { processTranscriptLine } from './transcriptParser.js';
@@ -526,6 +527,7 @@ export function adoptTerminalForFile(
  * transcript_path and cwd directly, no scanning needed.
  */
 export function adoptExternalSessionFromHook(
+  providerId: ProviderId,
   sessionId: string,
   transcriptPath: string | undefined,
   cwd: string,
@@ -609,7 +611,7 @@ export function adoptExternalSessionFromHook(
       linesProcessed: 0,
       seenUnknownRecordTypes: new Set(),
       folderName,
-      providerId: 'claude',
+      providerId,
     };
     agents.set(id, agent);
     persistAgents();
@@ -696,6 +698,11 @@ interface CodexSessionMeta {
   sessionId: string;
 }
 
+interface CopilotSessionMeta {
+  cwd?: string;
+  sessionId: string;
+}
+
 function getWorkspaceRoots(): string[] {
   const roots = (vscode.workspace.workspaceFolders ?? []).map((folder) => folder.uri.fsPath);
   return roots.length > 0 ? roots : [os.homedir()];
@@ -743,6 +750,51 @@ function collectCodexSessionFiles(dir: string, files: string[] = []): string[] {
     }
   }
   return files;
+}
+
+export function getCopilotSessionFile(sessionId: string): string {
+  return path.join(os.homedir(), '.copilot', 'session-state', sessionId, 'events.jsonl');
+}
+
+function readEscapedJsonField(snippet: string, fieldName: string): string | undefined {
+  const match = snippet.match(new RegExp(`"${fieldName}":"((?:\\\\.|[^"])*)"`, 'i'));
+  if (!match) return undefined;
+  try {
+    return JSON.parse(`"${match[1]}"`) as string;
+  } catch {
+    return undefined;
+  }
+}
+
+function readCopilotSessionMeta(jsonlFile: string): CopilotSessionMeta | null {
+  try {
+    const fd = fs.openSync(jsonlFile, 'r');
+    const buf = Buffer.alloc(32_768);
+    const bytesRead = fs.readSync(fd, buf, 0, buf.length, 0);
+    fs.closeSync(fd);
+    const snippet = buf.toString('utf-8', 0, bytesRead);
+    return {
+      cwd: readEscapedJsonField(snippet, 'cwd'),
+      sessionId: path.basename(path.dirname(jsonlFile)),
+    };
+  } catch {
+    return null;
+  }
+}
+
+function collectCopilotSessionFiles(): string[] {
+  const sessionsRoot = path.join(os.homedir(), '.copilot', 'session-state');
+  let entries: fs.Dirent[];
+  try {
+    entries = fs.readdirSync(sessionsRoot, { withFileTypes: true });
+  } catch {
+    return [];
+  }
+
+  return entries
+    .filter((entry) => entry.isDirectory())
+    .map((entry) => path.join(sessionsRoot, entry.name, 'events.jsonl'))
+    .filter((file) => fs.existsSync(file));
 }
 
 function scanCodexSessions(
@@ -793,9 +845,10 @@ function scanCodexSessions(
       continue;
     }
 
-    const pendingLaunch = listPendingCodexLaunches()
+    const pendingLaunch = listPendingTerminalLaunches()
       .filter(
         (launch) =>
+          launch.providerId === 'codex' &&
           launch.terminal.exitStatus === undefined &&
           pathsOverlap(launch.cwd, meta.cwd) &&
           now - launch.launchedAt <= 60_000,
@@ -809,7 +862,7 @@ function scanCodexSessions(
         clearInterval(launchPollTimer);
         jsonlPollTimers.delete(pendingLaunch.agentId);
       }
-      removePendingCodexLaunch(pendingLaunch.agentId);
+      removePendingTerminalLaunch(pendingLaunch.agentId);
       console.log(
         `[Pixel Agents] Watcher: matched Codex launch ${path.basename(file)} to terminal "${pendingLaunch.terminal.name}"`,
       );
@@ -860,6 +913,129 @@ function scanCodexSessions(
   }
 }
 
+function scanCopilotSessions(
+  knownJsonlFiles: Set<string>,
+  nextAgentIdRef: { current: number },
+  agents: Map<number, AgentState>,
+  activeAgentIdRef: { current: number | null },
+  fileWatchers: Map<number, fs.FSWatcher>,
+  pollingTimers: Map<number, ReturnType<typeof setInterval>>,
+  waitingTimers: Map<number, ReturnType<typeof setTimeout>>,
+  permissionTimers: Map<number, ReturnType<typeof setTimeout>>,
+  jsonlPollTimers: Map<number, ReturnType<typeof setInterval>>,
+  webview: vscode.Webview | undefined,
+  persistAgents: () => void,
+  watchAllSessions: boolean,
+): void {
+  const workspaceRoots = getWorkspaceRoots();
+  const now = Date.now();
+  const files = collectCopilotSessionFiles();
+
+  for (const file of files) {
+    if (knownJsonlFiles.has(file)) continue;
+    if (clearDismissedFiles.has(file)) continue;
+
+    const dismissedAt = dismissedJsonlFiles.get(file);
+    if (dismissedAt && now - dismissedAt < DISMISSED_COOLDOWN_MS) continue;
+    if (dismissedAt) dismissedJsonlFiles.delete(file);
+
+    let tracked = false;
+    for (const agent of agents.values()) {
+      if (path.resolve(agent.jsonlFile) === path.resolve(file)) {
+        tracked = true;
+        break;
+      }
+    }
+    if (tracked) continue;
+
+    try {
+      const stat = fs.statSync(file);
+      if (now - stat.mtimeMs > EXTERNAL_ACTIVE_THRESHOLD_MS) continue;
+    } catch {
+      continue;
+    }
+
+    const meta = readCopilotSessionMeta(file);
+    if (!meta) continue;
+
+    const matchedWorkspaceRoot = meta.cwd
+      ? workspaceRoots.find((root) => pathsOverlap(root, meta.cwd!))
+      : undefined;
+    const projectDir = meta.cwd || matchedWorkspaceRoot;
+
+    if (!projectDir) continue;
+    if (!watchAllSessions && !workspaceRoots.some((root) => pathsOverlap(root, projectDir))) {
+      continue;
+    }
+
+    const pendingLaunch = listPendingTerminalLaunches()
+      .filter(
+        (launch) =>
+          launch.providerId === 'copilot' &&
+          launch.terminal.exitStatus === undefined &&
+          pathsOverlap(launch.cwd, projectDir) &&
+          now - launch.launchedAt <= 60_000,
+      )
+      .sort((left, right) => right.launchedAt - left.launchedAt)[0];
+
+    knownJsonlFiles.add(file);
+    if (pendingLaunch) {
+      const launchPollTimer = jsonlPollTimers.get(pendingLaunch.agentId);
+      if (launchPollTimer) {
+        clearInterval(launchPollTimer);
+        jsonlPollTimers.delete(pendingLaunch.agentId);
+      }
+      removePendingTerminalLaunch(pendingLaunch.agentId);
+      console.log(
+        `[Pixel Agents] Watcher: matched Copilot launch ${path.basename(file)} to terminal "${pendingLaunch.terminal.name}"`,
+      );
+      adoptTerminalForFile(
+        pendingLaunch.terminal,
+        file,
+        projectDir,
+        nextAgentIdRef,
+        agents,
+        activeAgentIdRef,
+        fileWatchers,
+        pollingTimers,
+        waitingTimers,
+        permissionTimers,
+        webview,
+        persistAgents,
+        undefined,
+        pendingLaunch.agentId,
+        pendingLaunch.folderName,
+        meta.sessionId,
+      );
+      continue;
+    }
+
+    console.log(
+      `[Pixel Agents] Watcher: detected Copilot session ${meta.sessionId} (${path.basename(projectDir)})`,
+    );
+    adoptExternalSession(
+      file,
+      projectDir,
+      nextAgentIdRef,
+      agents,
+      fileWatchers,
+      pollingTimers,
+      waitingTimers,
+      permissionTimers,
+      webview,
+      persistAgents,
+      path.basename(projectDir),
+    );
+
+    const adoptedAgent = [...agents.values()].find((agent) => agent.jsonlFile === file);
+    if (adoptedAgent) {
+      adoptedAgent.sessionId = meta.sessionId;
+      adoptedAgent.providerId = 'copilot';
+      persistAgents();
+    }
+  }
+}
+
 /**
  * Periodically scans for external sessions (VS Code extension panel, etc.)
  * that produce JSONL files without an associated terminal.
@@ -869,6 +1045,7 @@ export function startExternalSessionScanning(
   knownJsonlFiles: Set<string>,
   nextAgentIdRef: { current: number },
   agents: Map<number, AgentState>,
+  activeAgentIdRef: { current: number | null },
   fileWatchers: Map<number, fs.FSWatcher>,
   pollingTimers: Map<number, ReturnType<typeof setInterval>>,
   waitingTimers: Map<number, ReturnType<typeof setTimeout>>,
@@ -904,6 +1081,20 @@ export function startExternalSessionScanning(
       knownJsonlFiles,
       nextAgentIdRef,
       agents,
+      fileWatchers,
+      pollingTimers,
+      waitingTimers,
+      permissionTimers,
+      _jsonlPollTimers,
+      webview,
+      persistAgents,
+      !!watchAllSessionsRef?.current,
+    );
+    scanCopilotSessions(
+      knownJsonlFiles,
+      nextAgentIdRef,
+      agents,
+      activeAgentIdRef,
       fileWatchers,
       pollingTimers,
       waitingTimers,
@@ -1172,7 +1363,7 @@ export function startStaleExternalAgentCheck(
 
       try {
         const stat = fs.statSync(agent.jsonlFile);
-        if (agent.providerId === 'codex') {
+        if (agent.providerId === 'codex' || agent.providerId === 'copilot') {
           const lastSeenAt = Math.max(agent.lastDataAt, stat.mtimeMs);
           if (Date.now() - lastSeenAt > GLOBAL_SCAN_ACTIVE_MAX_AGE_MS) {
             toRemove.push(id);

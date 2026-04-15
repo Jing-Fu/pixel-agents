@@ -43,6 +43,7 @@ export const SERVER_JSON_NAME = 'server.json';
 export const HOOK_SCRIPTS_DIR = '.pixel-agents/hooks';
 /** Output filename after esbuild compiles claude-hook.ts to CJS (source is .ts, output is .js) */
 export const CLAUDE_HOOK_SCRIPT_NAME = 'claude-hook.js';
+export const COPILOT_HOOK_SCRIPT_NAME = 'copilot-hook.js';
 export const HOOK_API_PREFIX = '/api/hooks';
 
 /** Hook events to install in ~/.claude/settings.json.
