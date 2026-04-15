@@ -9,7 +9,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as vscode from 'vscode';
 
-import { CHAR_COUNT, CHAR_FRAMES_PER_ROW, WALL_BITMASK_COUNT } from '../shared/assets/constants.js';
+import { CHAR_FRAMES_PER_ROW, WALL_BITMASK_COUNT } from '../shared/assets/constants.js';
 import type {
   FurnitureAsset,
   FurnitureManifest,
@@ -392,7 +392,7 @@ export function mergeCharacterSprites(
 }
 
 /**
- * Load pre-colored character sprites from assets/characters/ (6 PNGs, each 112×96).
+ * Load pre-colored character sprites from assets/characters/ (char_N.png, sorted by N).
  * Each PNG has 3 direction rows (down, up, right) × 7 frames (16×32 each).
  */
 export async function loadCharacterSprites(
@@ -400,17 +400,43 @@ export async function loadCharacterSprites(
 ): Promise<LoadedCharacterSprites | null> {
   try {
     const charDir = path.join(assetsRoot, 'assets', 'characters');
+    if (!fs.existsSync(charDir)) {
+      console.log('[AssetLoader] No characters/ directory found at:', charDir);
+      return null;
+    }
+
+    const entries = fs.readdirSync(charDir);
+    const charFiles: { index: number; filename: string }[] = [];
+    for (const entry of entries) {
+      const match = /^char_(\d+)\.png$/i.exec(entry);
+      if (match) {
+        charFiles.push({ index: parseInt(match[1], 10), filename: entry });
+      }
+    }
+
+    if (charFiles.length === 0) {
+      console.log('[AssetLoader] No char_N.png files found in characters/');
+      return null;
+    }
+
+    charFiles.sort((a, b) => a.index - b.index);
+
     const characters: CharacterDirectionSprites[] = [];
 
-    for (let ci = 0; ci < CHAR_COUNT; ci++) {
-      const filePath = path.join(charDir, `char_${ci}.png`);
-      if (!fs.existsSync(filePath)) {
-        console.log(`[AssetLoader] No character sprite found at: ${filePath}`);
-        return null;
+    for (const { filename } of charFiles) {
+      const filePath = path.join(charDir, filename);
+      try {
+        const pngBuffer = fs.readFileSync(filePath);
+        characters.push(decodeCharacterPng(pngBuffer));
+      } catch (err) {
+        console.warn(
+          `  [AssetLoader] ⚠️  Error loading character ${filename}: ${err instanceof Error ? err.message : err}`,
+        );
       }
+    }
 
-      const pngBuffer = fs.readFileSync(filePath);
-      characters.push(decodeCharacterPng(pngBuffer));
+    if (characters.length === 0) {
+      return null;
     }
 
     console.log(
