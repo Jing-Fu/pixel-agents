@@ -42,7 +42,7 @@ This is the source code for the free Pixel Agents extension for VS Code — inst
 - **Sub-agent visualization** — Task tool sub-agents spawn as separate characters linked to their parent
 - **Persistent layouts** — your office design is saved and shared across VS Code windows
 - **External asset directories** — load custom or third-party furniture packs from any folder on your machine
-- **Diverse characters** — 7 built-in characters (including Pikachu from PMD Sprite Repository). Most are based on the amazing work of [JIK-A-4, Metro City](https://jik-a-4.itch.io/metrocity-free-topdown-character-pack).
+- **Diverse characters** — 7 built-in characters adapted from [PMD Sprite Repository](https://sprites.pmdcollab.org/) / [SpriteCollab](https://github.com/PMDCollab/SpriteCollab): Bulbasaur, Charmander, Squirtle, Eevee, Totodile, Treecko, and Pikachu.
 
 <p align="center">
   <img src="webview-ui/public/characters.png" alt="Pixel Agents characters" width="320" height="72" style="image-rendering: pixelated;">
@@ -100,12 +100,18 @@ To add a new furniture item, create a folder in `webview-ui/public/assets/furnit
 
 To use furniture from an external directory, open Settings → **Add Asset Directory**. See [docs/external-assets.md](docs/external-assets.md) for the full manifest format and how to use third-party asset packs.
 
-Characters are based on the amazing work of [JIK-A-4, Metro City](https://jik-a-4.itch.io/metrocity-free-topdown-character-pack).
+Characters are adapted from [PMD Sprite Repository](https://sprites.pmdcollab.org/) / [SpriteCollab](https://github.com/PMDCollab/SpriteCollab). The bundled character slots currently map to:
 
-Additional character attribution:
+- `char_0` — [Bulbasaur (`0001`, form `0`)](https://sprites.pmdcollab.org/#/0001?form=0)
+- `char_1` — [Charmander (`0004`, form `0`)](https://sprites.pmdcollab.org/#/0004?form=0)
+- `char_2` — [Squirtle (`0007`, form `0`)](https://sprites.pmdcollab.org/#/0007?form=0)
+- `char_3` — [Eevee (`0133`, form `0`)](https://sprites.pmdcollab.org/#/0133?form=0)
+- `char_4` — [Totodile (`0158`, form `0`)](https://sprites.pmdcollab.org/#/0158?form=0)
+- `char_5` — [Treecko (`0252`, form `0`)](https://sprites.pmdcollab.org/#/0252?form=0)
+- `char_6` — [Pikachu (`0025`, form `0`)](https://sprites.pmdcollab.org/#/0025?form=0)
 
-- `char_6` (Pikachu) is adapted from [PMD Sprite Repository](https://sprites.pmdcollab.org/#/0025?form=0) / [SpriteCollab](https://github.com/PMDCollab/SpriteCollab).
-- Primary credit for this sprite set is `CHUNSOFT` (per SpriteCollab metadata for `0025` form `0`).
+Primary credit for these sprite sets is `CHUNSOFT` (per SpriteCollab metadata for the bundled base forms).
+
 - SpriteCollab submission/use policy: [SpriteCollab README](https://github.com/PMDCollab/SpriteCollab/blob/master/README.md).
 
 ## How It Works
